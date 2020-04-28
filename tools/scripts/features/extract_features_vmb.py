@@ -13,14 +13,46 @@ import os
 import cv2
 import numpy as np
 import torch
-from maskrcnn_benchmark.config import cfg
-from maskrcnn_benchmark.layers import nms
-from maskrcnn_benchmark.modeling.detector import build_detection_model
-from maskrcnn_benchmark.structures.image_list import to_image_list
-from maskrcnn_benchmark.utils.model_serialization import load_state_dict
-from PIL import Image
 
-from mmf.utils.general import download_file
+# from maskrcnn_benchmark.config import cfg
+# from maskrcnn_benchmark.layers import nms
+# from maskrcnn_benchmark.modeling.detector import build_detection_model
+# from maskrcnn_benchmark.structures.image_list import to_image_list
+# from maskrcnn_benchmark.utils.model_serialization import load_state_dict
+from PIL import Image
+from torchvision.models.detection.image_list import ImageList
+
+from mmf.utils.configuration import get_mmf_cache_dir
+from mmf.utils.download import download
+from mmf.utils.file_io import PathManager
+
+
+def modify_state_dict(state):
+    from copy import deepcopy
+
+    state = deepcopy(state)
+    model = state.pop("model", state)
+    new_state = {}
+    anchors = []
+    for key, value in model.items():
+        original_key = key
+        key = key.replace("stem.", "")
+        if "fpn_inner" in key:
+            layer_number = key.split(".")[-2][-1]
+            key = key.replace(
+                "fpn_inner" + layer_number, "inner_blocks." + str(int(layer_number) - 1)
+            )
+        if "fpn_layer" in key:
+            layer_number = key.split(".")[-2][-1]
+            key = key.replace(
+                "fpn_layer" + layer_number, "layer_blocks." + str(int(layer_number) - 1)
+            )
+        if "box.feature_extractor" in key:
+            key = key.replace("box.feature_extractor", "box_head")
+        if "box.predictor" in key:
+            key = key.replace("box.predictor", "box_predictor")
+        new_state[key] = value
+    return {"model": new_state}
 
 
 class FeatureExtractor:
@@ -37,15 +69,20 @@ class FeatureExtractor:
         self.args = self.get_parser().parse_args()
         self.detection_model = self._build_detection_model()
 
-        os.makedirs(self.args.output_folder, exist_ok=True)
+        PathManager.mkdirs(self.args.output_folder)
 
     def _try_downloading_necessities(self):
         if self.args.model_file is None:
             print("Downloading model and configuration")
-            self.args.model_file = self.MODEL_URL.split("/")[-1]
-            self.args.config_file = self.CONFIG_URL.split("/")[-1]
-            download_file(self.MODEL_URL)
-            download_file(self.CONFIG_URL)
+            cache_dir = get_mmf_cache_dir()
+            self.args.model_file = os.path.join(
+                cache_dir, self.MODEL_URL.split("/")[-1]
+            )
+            self.args.config_file = os.path.join(
+                cache_dir, self.CONFIG_URL.split("/")[-1]
+            )
+            download_file(self.MODEL_URL, cache_dir, self.args.model_file)
+            download_file(self.CONFIG_URL, cache_dir, self.args.model_file)
 
     def get_parser(self):
         parser = argparse.ArgumentParser()
@@ -93,19 +130,37 @@ class FeatureExtractor:
             action="store_true",
             help="The model will output predictions for the background class when set",
         )
+        parser.add_argument(
+            "--maskrcnn",
+            action="store_true",
+            help="The model will output predictions for the background class when set",
+        )
         return parser
 
     def _build_detection_model(self):
-        cfg.merge_from_file(self.args.config_file)
-        cfg.freeze()
-
-        model = build_detection_model(cfg)
         checkpoint = torch.load(self.args.model_file, map_location=torch.device("cpu"))
+        model_dict = checkpoint.pop("model")
 
-        load_state_dict(model, checkpoint.pop("model"))
+        if self.args.maskrcnn:
+            from maskrcnn_benchmark.config import cfg
+            from maskrcnn_benchmark.modeling.detector import build_detection_model
+            from maskrcnn_benchmark.utils.model_serialization import load_state_dict
+
+            cfg.merge_from_file(self.args.config_file)
+            cfg.freeze()
+
+            model = build_detection_model(cfg)
+            load_state_dict(model, model_dict)
+        else:
+            from mmf.models.detection import build_custom_mb_faster_rcnn
+
+            model = build_custom_mb_faster_rcnn()
+            updated_dict = modify_state_dict(model_dict)
+            model.load_state_dict(updated_dict["model"])
 
         model.to("cuda")
         model.eval()
+
         return model
 
     def _image_transform(self, path):
@@ -147,18 +202,39 @@ class FeatureExtractor:
     def _process_feature_extraction(
         self, output, im_scales, im_infos, feature_name="fc6", conf_thresh=0
     ):
-        batch_size = len(output[0]["proposals"])
-        n_boxes_per_image = [len(boxes) for boxes in output[0]["proposals"]]
-        score_list = output[0]["scores"].split(n_boxes_per_image)
-        score_list = [torch.nn.functional.softmax(x, -1) for x in score_list]
-        feats = output[0][feature_name].split(n_boxes_per_image)
-        cur_device = score_list[0].device
+        import pdb; pdb.set_trace()
+        if self.args.maskrcnn:
+            batch_size = len(output[0]["proposals"])
+            n_boxes_per_image = [len(boxes) for boxes in output[0]["proposals"]]
+            score_list = output[0]["scores"].split(n_boxes_per_image)
+            score_list = [torch.nn.functional.softmax(x, -1) for x in score_list]
+            feats = output[0][feature_name].split(n_boxes_per_image)
+            cur_device = score_list[0].device
+            import maskrcnn_benchmark
+
+            nms = maskrcnn_benchmark.layers.nms
+        else:
+            batch_size = len(output)
+            n_boxes_per_image = [len(o["proposals"]) for o in output]
+            score_list = [o["scores"] for o in output]
+            score_list = [torch.nn.functional.softmax(x, -1) for x in score_list]
+            feats = [o[feature_name] for o in output]
+            cur_device = score_list[0].device
+            import torchvision
+
+            nms = torchvision.ops.boxes.nms
 
         feat_list = []
         info_list = []
 
         for i in range(batch_size):
-            dets = output[0]["proposals"][i].bbox / im_scales[i]
+            if self.args.maskrcnn:
+                proposals = output[0]["proposals"][i]
+                bbox = proposals.bbox
+            else:
+                proposals = output[i]["proposals"]
+                bbox = proposals
+            dets = bbox / im_scales[i]
             scores = score_list[i]
             max_conf = torch.zeros((scores.shape[0])).to(cur_device)
             conf_thresh_tensor = torch.full_like(max_conf, conf_thresh)
@@ -176,12 +252,19 @@ class FeatureExtractor:
                     cls_scores[keep],
                     max_conf[keep],
                 )
+            best_scores, best_score_indices = scores.max(dim=-1)
+            ke = nms(dets, best_scores, 0.5)
+            to_keep = torch.sort(best_scores[ke], descending=True)[1][:100]
+            ke = ke[to_keep]
 
             sorted_scores, sorted_indices = torch.sort(max_conf, descending=True)
             num_boxes = (sorted_scores[: self.args.num_features] != 0).sum()
             keep_boxes = sorted_indices[: self.args.num_features]
             feat_list.append(feats[i][keep_boxes])
-            bbox = output[0]["proposals"][i][keep_boxes].bbox / im_scales[i]
+            bbox = (
+                getattr(proposals[keep_boxes], "bbox", proposals[keep_boxes])
+                / im_scales[i]
+            )
             # Predict the class label using the scores
             objects = torch.argmax(scores[keep_boxes][:, start_index:], dim=1)
 
@@ -209,7 +292,12 @@ class FeatureExtractor:
 
         # Image dimensions should be divisible by 32, to allow convolutions
         # in detector to work
-        current_img_list = to_image_list(img_tensor, size_divisible=32)
+        if self.args.maskrcnn:
+            from maskrcnn_benchmark.structures.image_list import to_image_list
+
+            current_img_list = to_image_list(img_tensor, size_divisible=32)
+        else:
+            current_img_list = self.to_image_list(img_tensor, size_divisible=32)
         current_img_list = current_img_list.to("cuda")
 
         with torch.no_grad():
@@ -225,6 +313,53 @@ class FeatureExtractor:
 
         return feat_list
 
+    def to_image_list(self, tensors, size_divisible=0):
+        """
+        tensors can be an ImageList, a torch.Tensor or
+        an iterable of Tensors. It can't be a numpy array.
+        When tensors is an iterable of Tensors, it pads
+        the Tensors with zeros so that they have the same
+        shape
+        """
+        if isinstance(tensors, torch.Tensor) and size_divisible > 0:
+            tensors = [tensors]
+
+        if isinstance(tensors, ImageList):
+            return tensors
+        elif isinstance(tensors, torch.Tensor):
+            # single tensor shape can be inferred
+            if tensors.dim() == 3:
+                tensors = tensors[None]
+            assert tensors.dim() == 4
+            image_sizes = [tensor.shape[-2:] for tensor in tensors]
+            return ImageList(tensors, image_sizes)
+        elif isinstance(tensors, (tuple, list)):
+            max_size = tuple(max(s) for s in zip(*[img.shape for img in tensors]))
+
+            # TODO Ideally, just remove this and let me model handle arbitrary
+            # input sizs
+            if size_divisible > 0:
+                import math
+
+                stride = size_divisible
+                max_size = list(max_size)
+                max_size[1] = int(math.ceil(max_size[1] / stride) * stride)
+                max_size[2] = int(math.ceil(max_size[2] / stride) * stride)
+                max_size = tuple(max_size)
+
+            batch_shape = (len(tensors),) + max_size
+            batched_imgs = tensors[0].new(*batch_shape).zero_()
+            for img, pad_img in zip(tensors, batched_imgs):
+                pad_img[: img.shape[0], : img.shape[1], : img.shape[2]].copy_(img)
+
+            image_sizes = [im.shape[-2:] for im in tensors]
+
+            return ImageList(batched_imgs, image_sizes)
+        else:
+            raise TypeError(
+                "Unsupported type for to_image_list: {}".format(type(tensors))
+            )
+
     def _chunks(self, array, chunk_size):
         for i in range(0, len(array), chunk_size):
             yield array[i : i + chunk_size]
@@ -236,9 +371,27 @@ class FeatureExtractor:
         file_base_name = file_base_name + ".npy"
 
         np.save(
-            os.path.join(self.args.output_folder, file_base_name), feature.cpu().numpy()
+            PathManager.open(
+                os.path.join(self.args.output_folder, file_base_name), mode="wb"
+            ),
+            feature.cpu().numpy(),
         )
-        np.save(os.path.join(self.args.output_folder, info_file_base_name), info)
+        np.save(
+            PathManager.open(
+                os.path.join(self.args.output_folder, info_file_base_name), mode="wb"
+            ),
+            info,
+        )
+
+    def files_based_on_extension(self, path, extensions):
+        files = []
+        all_files = PathManager.ls(path)
+        for f in all_files:
+            for ext in extensions:
+                if f.endswith(ext):
+                    files.append(os.path.join(path, f))
+                    break
+        return files
 
     def extract_features(self):
         image_dir = self.args.image_dir
@@ -247,9 +400,8 @@ class FeatureExtractor:
             features, infos = self.get_detectron_features([image_dir])
             self._save_feature(image_dir, features[0], infos[0])
         else:
-            files = glob.glob(os.path.join(image_dir, "*.png"))
-            files.extend(glob.glob(os.path.join(image_dir, "*.jpg")))
-            files.extend(glob.glob(os.path.join(image_dir, "*.jpeg")))
+            extensions = [".png", ".jpg", ".jpeg"]
+            files = self.files_based_on_extension(image_dir, extensions)
             files = {f: 1 for f in files}
             exclude = {}
 
@@ -260,7 +412,9 @@ class FeatureExtractor:
                         exclude[
                             line.strip("\n").split(os.path.sep)[-1].split(".")[0]
                         ] = 1
-            output_files = glob.glob(os.path.join(self.args.output_folder, "*.npy"))
+            output_files = self.files_based_on_extension(
+                self.args.output_folder, [".npy"]
+            )
             output_dict = {}
             for f in output_files:
                 file_name = f.split(os.path.sep)[-1].split(".")[0]
